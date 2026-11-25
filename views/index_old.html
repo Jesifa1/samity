@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Samity Manager</title>
+<link rel="icon" href="data:,">
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 1000px; margin: 20px auto; padding: 0 12px; color: #222; }
+  h1 { font-size: 22px; }
+  h2 { font-size: 17px; margin-top: 28px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+  form { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+  label { font-size: 12px; display: flex; flex-direction: column; gap: 2px; }
+  input, select, button { padding: 6px 8px; font-size: 14px; }
+  button { cursor: pointer; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin-top: 8px; }
+  th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+  th { background: #f5f5f5; }
+  .wrap { overflow-x: auto; }
+  .msg { margin: 8px 0; padding: 8px; border-radius: 4px; display: none; }
+  .ok { background: #e6f4ea; display: block; }
+  .err { background: #fce8e6; display: block; }
+  .closed { color: #888; }
+</style>
+</head>
+<body>
+<h1>Samity / Installment Manager</h1>
+<button id="logout" style="float:right">Logout</button>
+<div id="msg" class="msg"></div>
+
+<h2>1. New member</h2>
+<form id="memberForm">
+  <label>Name <input name="name" required></label>
+  <label>Phone <input name="phone" placeholder="01XXXXXXXXX" required></label>
+  <button>Add member</button>
+</form>
+
+<h2>2. New loan</h2>
+<form id="loanForm">
+  <label>Member <select name="memberId" id="memberSelect" required></select></label>
+  <label>Principal (Tk) <input name="principal" type="number" min="1" step="0.01" required></label>
+  <label>Interest (%) <input name="interestRate" type="number" min="0" step="0.01" value="10" required></label>
+  <label>Number of installments <input name="installments" type="number" min="1" step="1" value="10" required></label>
+  <label>Frequency
+    <select name="frequency"><option>WEEKLY</option><option>MONTHLY</option></select>
+  </label>
+  <label>Start date <input name="startDate" type="date" required></label>
+  <button>Create loan</button>
+</form>
+
+<h2>3. Loans and payments</h2>
+<div class="wrap"><table id="loansTable"></table></div>
+<div id="scheduleOut" class="wrap"></div>
+
+<h2>4. Overdue installments (up to today)</h2>
+<div class="wrap"><table id="overdueTable"></table></div>
+
+<h2>5. Reports</h2>
+<form id="reportForm">
+  <label>Month <input type="month" name="month" required></label>
+  <button>Monthly collection</button>
+  <button type="button" id="tbBtn">Trial balance</button>
+  <label>Member <select id="stMember"></select></label>
+  <button type="button" id="stBtn">Member statement</button>
+</form>
+<div id="reportOut" class="wrap"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+let msgTimer;
+function show(text, ok = true, html = false) {
+  const m = $('msg');
+  m.className = 'msg ' + (ok ? 'ok' : 'err');
+  if (html) m.innerHTML = text; else m.textContent = text;
+  clearTimeout(msgTimer);
+  msgTimer = setTimeout(() => { m.className = 'msg'; }, 8000);
+}
+
+async function api(url, method = 'GET', body) {
+  const res = await fetch(url, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 401) {
+    location.href = '/login.html';
+    throw new Error('Please log in');
+  }
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Error');
+  return data;
+}
+
+async function load() {
+  const [members, loans, due] = await Promise.all([
+    api('/api/members'), api('/api/loans'), api('/api/overdue'),
+  ]);
+
+  // Member dropdowns (loan form and member statement)
+  const memberOptions = members
+    .map(m => `<option value="${m.id}">${esc(m.name)} (${esc(m.phone)})</option>`)
+    .join('');
+  $('memberSelect').innerHTML = memberOptions;
+  $('stMember').innerHTML = memberOptions;
+
+  // Loans table
+  $('loansTable').innerHTML =
+    '<tr><th>ID</th><th>Member</th><th>Principal</th><th>Total</th><th>Paid</th>' +
+    '<th>Remaining</th><th>Fine due</th><th>Status</th><th>Pay installment</th></tr>' +
+    (loans.map(l => `<tr class="${l.status === 'CLOSED' ? 'closed' : ''}">
+      <td>${l.id} <button data-sched="${l.id}">Schedule</button></td>
+      <td>${esc(l.name)}</td><td>${l.principal}</td>
+      <td>${l.total}</td><td>${l.paid}</td><td>${l.remaining}</td>
+      <td>${l.fine_due > 0
+        ? `${l.fine_due} <input type="number" min="0.01" step="0.01" id="fine-${l.id}" style="width:70px">
+           <button data-payfine="${l.id}">Pay fine</button>`
+        : '0'}</td>
+      <td>${l.status}</td>
+      <td>${l.status === 'ACTIVE'
+        ? `<input type="number" min="0.01" step="0.01" id="amt-${l.id}" style="width:90px">
+           <button data-pay="${l.id}">Pay</button>`
+        : '-'}</td></tr>`).join('') ||
+    '<tr><td colspan="9">No loans yet</td></tr>');
+
+  // Overdue table
+  $('overdueTable').innerHTML =
+    '<tr><th>Member</th><th>Phone</th><th>Loan</th><th>Installment #</th>' +
+    '<th>Due date</th><th>Due (Tk)</th><th>Days late</th></tr>' +
+    (due.map(r => `<tr><td>${esc(r.name)}</td><td>${esc(r.phone)}</td><td>${r.loan_id}</td>
+      <td>${r.seq}</td><td>${r.due_date}</td><td>${r.due_amount}</td><td>${r.days_late}</td></tr>`).join('')
+    || '<tr><td colspan="7">No overdue installments</td></tr>');
+}
+
+// ---- New member ----
+$('memberForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  try {
+    const f = e.target;
+    await api('/api/members', 'POST', { name: f.name.value, phone: f.phone.value });
+    f.reset();
+    show('Member added');
+    load();
+  } catch (err) { show(err.message, false); }
+});
+
+// ---- New loan ----
+$('loanForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  try {
+    const f = e.target;
+    const r = await api('/api/loans', 'POST', {
+      memberId: f.memberId.value, principal: f.principal.value,
+      interestRate: f.interestRate.value, installments: f.installments.value,
+      frequency: f.frequency.value, startDate: f.startDate.value,
+    });
+    show('Loan #' + r.id + ' created');
+    load();
+  } catch (err) { show(err.message, false); }
+});
+
+// ---- Schedule / pay installment / pay fine ----
+$('loansTable').addEventListener('click', async e => {
+  try {
+    const { pay, payfine, sched } = e.target.dataset;
+
+    if (sched) {
+      const rows = await api(`/api/loans/${sched}/installments`);
+      $('scheduleOut').innerHTML = `<h3>Loan #${sched} schedule</h3>` +
+        '<table><tr><th>#</th><th>Due date</th><th>Due</th><th>Paid</th><th>Status</th></tr>' +
+        rows.map(r => {
+          const left = Math.round((r.amount_due - r.amount_paid) * 100) / 100;
+          const status = left <= 0 ? 'Paid' : (r.amount_paid > 0 ? 'Partial' : 'Unpaid');
+          return `<tr><td>${r.seq}</td><td>${r.due_date}</td><td>${r.amount_due}</td>` +
+                 `<td>${r.amount_paid}</td><td>${status}</td></tr>`;
+        }).join('') + '</table>';
+      return;
+    }
+
+    if (pay) {
+      const r = await api('/api/payments', 'POST', { loanId: pay, amount: $('amt-' + pay).value });
+      show(`Tk ${r.paid} received. Total paid: ${r.totalPaid}, remaining: ${r.remaining}. ` +
+           `<a href="/api/receipt/${r.txId}" target="_blank">Receipt PDF</a>`, true, true);
+    } else if (payfine) {
+      const r = await api('/api/fines/pay', 'POST', { loanId: payfine, amount: $('fine-' + payfine).value });
+      show(`Fine Tk ${r.paid} received. Fine remaining: ${r.remaining}. ` +
+           `<a href="/api/receipt/${r.txId}" target="_blank">Receipt PDF</a>`, true, true);
+    } else {
+      return;
+    }
+    load();
+  } catch (err) { show(err.message, false); }
+});
+
+// ---- Logout ----
+$('logout').addEventListener('click', async () => {
+  try {
+    await api('/api/logout', 'POST', {});
+  } catch (err) { /* ignore */ }
+  location.href = '/login.html';
+});
+
+// ---- Reports: monthly collection ----
+$('reportForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  try {
+    const r = await api('/api/reports/monthly?month=' + e.target.month.value);
+    $('reportOut').innerHTML =
+      `<p>Total collected: <b>${r.totals.total_cash}</b> ` +
+      `(principal ${r.totals.principal}, interest ${r.totals.interest}, fines ${r.totals.fines})</p>` +
+      '<table><tr><th>Member</th><th>Phone</th><th>Collected (Tk)</th></tr>' +
+      (r.byMember.map(m =>
+        `<tr><td>${esc(m.name)}</td><td>${esc(m.phone)}</td><td>${m.collected}</td></tr>`
+      ).join('') || '<tr><td colspan="3">No collections this month</td></tr>') +
+      '</table>';
+  } catch (err) { show(err.message, false); }
+});
+
+// ---- Reports: trial balance ----
+$('tbBtn').addEventListener('click', async () => {
+  try {
+    const r = await api('/api/reports/trial-balance');
+    $('reportOut').innerHTML =
+      '<table><tr><th>Account</th><th>Type</th><th>Debit</th><th>Credit</th></tr>' +
+      r.rows.map(a =>
+        `<tr><td>${esc(a.name)}</td><td>${a.type}</td><td>${a.debit}</td><td>${a.credit}</td></tr>`
+      ).join('') +
+      `<tr><th colspan="2">Total</th><th>${r.totals.debit}</th><th>${r.totals.credit}</th></tr></table>` +
+      `<p>${r.balanced ? 'Balanced: total debit equals total credit.' : 'NOT BALANCED: check the ledger!'}</p>`;
+  } catch (err) { show(err.message, false); }
+});
+
+// ---- Reports: member statement ----
+$('stBtn').addEventListener('click', async () => {
+  try {
+    const id = $('stMember').value;
+    if (!id) throw new Error('Add a member first');
+    const r = await api(`/api/members/${id}/statement`);
+
+    $('reportOut').innerHTML =
+      `<p><b>${esc(r.member.name)}</b> (${esc(r.member.phone)}), joined ${r.member.joined_at}</p>` +
+      '<table><tr><th>Loan</th><th>Status</th><th>Total</th><th>Paid</th><th>Remaining</th></tr>' +
+      (r.loans.map(l =>
+        `<tr><td>${l.id}</td><td>${l.status}</td><td>${l.total}</td><td>${l.paid}</td><td>${l.remaining}</td></tr>`
+      ).join('') || '<tr><td colspan="5">No loans</td></tr>') + '</table>' +
+      '<h3>Payments</h3>' +
+      '<table><tr><th>Date</th><th>Loan</th><th>Description</th><th>Amount (Tk)</th></tr>' +
+      (r.payments.map(p =>
+        `<tr><td>${p.date}</td><td>${p.loan_id}</td><td>${esc(p.description)}</td><td>${p.amount}</td></tr>`
+      ).join('') || '<tr><td colspan="4">No payments yet</td></tr>') + '</table>';
+  } catch (err) { show(err.message, false); }
+});
+
+// ---- Initial load (keep this last) ----
+load().catch(err => show(err.message, false));
+</script>
+</body>
+</html>
